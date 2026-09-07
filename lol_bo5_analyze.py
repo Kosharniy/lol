@@ -74,7 +74,10 @@ S = pd.DataFrame(bo5); print(f"BO5 series: {len(S)}  (Primary {sum(S.level=='Pri
 
 # ---------------------------------------------------------------- market prior (Pinnacle closing) + Polymarket timeline
 fx = pd.read_csv(DATA / "op_fixtures.csv") if (DATA / "op_fixtures.csv").exists() else pd.DataFrame()
-pr = pd.read_csv(DATA / "op_prices.csv") if (DATA / "op_prices.csv").exists() else pd.DataFrame()
+# op_prices.csv може бути ~1 ГБ (усі ринки Pinnacle); якщо є відфільтрований op_prices_winner.csv (лише ринок Winner) — беремо його
+_pf = DATA / "op_prices_winner.csv" if (DATA / "op_prices_winner.csv").exists() else DATA / "op_prices.csv"
+pr = pd.read_csv(_pf, dtype={"fixture_id": str, "bookmaker": str, "market_id": str, "outcome_id": str}) if _pf.exists() else pd.DataFrame()
+print("[prices]", _pf, len(pr), "rows")
 winner_mid = None
 if (DATA / "raw/markets.json").exists():
     ms = json.loads((DATA / "raw/markets.json").read_text())
