@@ -77,10 +77,15 @@ fx = pd.read_csv(DATA / "op_fixtures.csv") if (DATA / "op_fixtures.csv").exists(
 pr = pd.read_csv(DATA / "op_prices.csv") if (DATA / "op_prices.csv").exists() else pd.DataFrame()
 winner_mid = None
 if (DATA / "raw/markets.json").exists():
-    for m in json.loads((DATA / "raw/markets.json").read_text()):
-        nm = m.get("marketName", "").lower()
-        if re.search(r"winner|moneyline|match result|1x2|head.?to.?head", nm) and len(m.get("outcomes", [])) in (2, 3):
-            winner_mid = m["marketId"]; print("[market] winner market:", m["marketName"], winner_mid); break
+    ms = json.loads((DATA / "raw/markets.json").read_text())
+    present = set(pr.market_id.astype(str)) if not pr.empty and "market_id" in pr.columns else set()
+    # 1) точна назва "Winner" з 2 outcomes, яка реально є в op_prices; 2) будь-який winner-подібний ринок, що є в даних; 3) fallback
+    for pick in (lambda m: m.get("marketName", "").strip().lower() == "winner" and len(m.get("outcomes", [])) == 2 and str(m["marketId"]) in present,
+                 lambda m: re.search(r"winner|moneyline", m.get("marketName", ""), re.I) and len(m.get("outcomes", [])) == 2 and str(m["marketId"]) in present,
+                 lambda m: m.get("marketName", "").strip().lower() == "winner" and len(m.get("outcomes", [])) == 2):
+        for m in ms:
+            if pick(m): winner_mid = m["marketId"]; print("[market] winner market:", m["marketName"], winner_mid, [(o.get("outcomeId"), o.get("outcomeName")) for o in m["outcomes"]]); break
+        if winner_mid is not None: break
     if winner_mid is None: print("[market] WINNER MARKET NOT FOUND — see data/raw/markets.json, set winner_mid manually")
 
 def match_fixture(row):
@@ -109,7 +114,7 @@ if not fx.empty and winner_mid is not None and not pr.empty:
         if h.empty: continue
         last = h.groupby("outcome_id").tail(1).set_index("outcome_id").price
         if len(last) < 2: continue
-        oids = sorted(last.index); o1, o2 = last[oids[0]], last[oids[1]]  # outcome1 = participant1 (перевірити в markets.json!)
+        oids = sorted(last.index); o1, o2 = last[oids[0]], last[oids[1]]  # для ринку 121: outcome 121='1'=participant1, 122='2'=participant2
         q1, q2 = 1 / o1, 1 / o2; p1 = q1 / (q1 + q2)
         S.at[i, "p_pin_A"] = (1 - p1) if flip else p1
     print("matched fixtures:", S.fixture_id.notna().sum(), " with Pinnacle close:", S.p_pin_A.notna().sum())
