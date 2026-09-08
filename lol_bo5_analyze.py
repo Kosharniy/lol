@@ -115,10 +115,13 @@ if not fx.empty and winner_mid is not None and not pr.empty:
         start = pd.to_datetime(start, utc=True)
         h = prw[(prw.fixture_id == fid) & (prw.bookmaker == "pinnacle") & (prw.recorded_at < start)].sort_values("recorded_at")
         if h.empty: continue
-        last = h.groupby("outcome_id").tail(1).set_index("outcome_id").price
+        # closing = медіана останніх 5 снапшотів кожного outcome (в історії є "active: false" призупинені лінії, які ми не зберегли як поле)
+        last = h.groupby("outcome_id").tail(5).groupby("outcome_id").price.median()
         if len(last) < 2: continue
-        oids = sorted(last.index); o1, o2 = last[oids[0]], last[oids[1]]  # для ринку 121: outcome 121='1'=participant1, 122='2'=participant2
-        q1, q2 = 1 / o1, 1 / o2; p1 = q1 / (q1 + q2)
+        oids = sorted(last.index, key=lambda x: int(x)); o1, o2 = last[oids[0]], last[oids[1]]  # ринок 181: outcome 181='1'=participant1, 182='2'=participant2
+        q1, q2 = 1 / o1, 1 / o2
+        if not (1.0 <= q1 + q2 <= 1.15): continue  # sanity: маржа Pinnacle 2–6%
+        p1 = q1 / (q1 + q2)
         S.at[i, "p_pin_A"] = (1 - p1) if flip else p1
     print("matched fixtures:", S.fixture_id.notna().sum(), " with Pinnacle close:", S.p_pin_A.notna().sum())
 
@@ -170,9 +173,11 @@ if not pr.empty and winner_mid is not None and S.fixture_id.notna().any():
             t_end = pd.Timestamp(r.ends[k]).tz_localize("UTC") + pd.Timedelta(minutes=40)  # ~кінець гри k (dt = початок гри) — уточнити
             after = h[(h.recorded_at >= t_end) & (h.recorded_at <= t_end + pd.Timedelta(minutes=12))].sort_values("recorded_at")
             if after.empty: continue
-            last = after.groupby("outcome_id").tail(1).set_index("outcome_id").price
+            last = after.groupby("outcome_id").tail(3).groupby("outcome_id").price.median()
             if len(last) < 2: continue
-            oids = sorted(last.index); q = [1 / last[o] for o in oids]; p_fav_mkt = q[0] / sum(q) if fav == "A" else q[1] / sum(q)
+            oids = sorted(last.index, key=lambda x: int(x)); q = [1 / last[o] for o in oids]
+            if not (0.95 <= sum(q) <= 1.2): continue
+            p_fav_mkt = q[0] / sum(q) if fav == "A" else q[1] / sum(q)
             rows.append({"match_id": r.match_id, "date": r.date, "level": r.level, "state": st, "p_fav_prior": pf,
                          "p_fav_indep": p_series(pf, fw, fl), "p_fav_market": p_fav_mkt, "fav_won": int(r.winner == fav)})
     if rows:
