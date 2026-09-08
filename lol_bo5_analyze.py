@@ -104,14 +104,14 @@ def match_fixture(row):
         if sc > bs: bs, best = sc, (c.fixtureId, flip, c.startTime)
     return best if bs >= 150 else None
 
-S["fixture_id"] = None; S["p_pin_A"] = None
+S["fixture_id"] = None; S["p_pin_A"] = None; S["flip"] = False
 if not fx.empty and winner_mid is not None and not pr.empty:
     pr["recorded_at"] = pd.to_datetime(pr.recorded_at, utc=True); pr["market_id"] = pr.market_id.astype(str)
     prw = pr[pr.market_id == str(winner_mid)]
     for i, row in S.iterrows():
         mf = match_fixture(row)
         if not mf: continue
-        fid, flip, start = mf; S.at[i, "fixture_id"] = fid
+        fid, flip, start = mf; S.at[i, "fixture_id"] = fid; S.at[i, "flip"] = bool(flip)
         start = pd.to_datetime(start, utc=True)
         h = prw[(prw.fixture_id == fid) & (prw.bookmaker == "pinnacle") & (prw.recorded_at < start)].sort_values("recorded_at")
         if h.empty: continue
@@ -178,13 +178,15 @@ def price_at_score(bookmaker):
             fw += (ch == fav); fl += (ch != fav); st = f"{fw}:{fl}"
             if k + 1 >= len(starts): break  # серія закінчилась — наступної гри нема
             t_next = starts[k + 1]
-            win = h[(h.recorded_at >= t_next - pd.Timedelta(minutes=25)) & (h.recorded_at <= t_next - pd.Timedelta(minutes=1))]
+            # останній снапшот кожного outcome перед стартом наступної гри (вікно ≤15 хв) — це ціна "між іграми" при відомому рахунку
+            win = h[(h.recorded_at >= t_next - pd.Timedelta(minutes=15)) & (h.recorded_at <= t_next - pd.Timedelta(seconds=30))]
             if win.empty: continue
-            last = win.sort_values("recorded_at").groupby("outcome_id").tail(3).groupby("outcome_id").price.median()
+            last = win.sort_values("recorded_at").groupby("outcome_id").tail(1).set_index("outcome_id").price
             if len(last) < 2: continue
             oids = sorted(last.index, key=lambda x: int(x)); q = [1 / last[o] for o in oids]
             if not (0.95 <= sum(q) <= 1.2): continue
-            p_fav_mkt = q[0] / sum(q) if fav == "A" else q[1] / sum(q)
+            pA_mkt = q[1] / sum(q) if r.flip else q[0] / sum(q)   # outcome '1' = participant1 фікстури; flip → participant1 = Leaguepedia B
+            p_fav_mkt = pA_mkt if fav == "A" else 1 - pA_mkt
             rows.append({"match_id": r.match_id, "date": r.date, "level": r.level, "state": st, "p_fav_prior": pf,
                          "p_fav_indep": p_series(pf, fw, fl), "p_fav_market": p_fav_mkt, "fav_won": int(r.winner == fav)})
     print(f"[{bookmaker}] fixtures with in-play snapshots: {n_inplay}; state-price points: {len(rows)}")
