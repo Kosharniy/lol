@@ -76,7 +76,8 @@ S = pd.DataFrame(bo5); print(f"BO5 series: {len(S)}  (Primary {sum(S.level=='Pri
 fx = pd.read_csv(DATA / "op_fixtures.csv") if (DATA / "op_fixtures.csv").exists() else pd.DataFrame()
 # op_prices.csv може бути ~1 ГБ (усі ринки Pinnacle); якщо є відфільтрований op_prices_winner.csv (лише ринок Winner) — беремо його
 _pf = DATA / "op_prices_winner.csv" if (DATA / "op_prices_winner.csv").exists() else DATA / "op_prices.csv"
-pr = pd.read_csv(_pf, dtype={"fixture_id": str, "bookmaker": str, "market_id": str, "outcome_id": str}) if _pf.exists() else pd.DataFrame()
+pr = pd.read_csv(_pf, dtype={"fixture_id": str, "bookmaker": str, "market_id": str, "outcome_id": str, "player": str}, low_memory=False) if _pf.exists() else pd.DataFrame()
+if not pr.empty: pr["limit"] = pd.to_numeric(pr["limit"], errors="coerce"); pr["price"] = pd.to_numeric(pr["price"], errors="coerce")
 print("[prices]", _pf, len(pr), "rows")
 winner_mid = None
 if (DATA / "raw/markets.json").exists():
@@ -181,21 +182,28 @@ def price_at_score(bookmaker):
             # останній снапшот кожного outcome перед стартом наступної гри (вікно ≤15 хв) — це ціна "між іграми" при відомому рахунку
             win = h[(h.recorded_at >= t_next - pd.Timedelta(minutes=15)) & (h.recorded_at <= t_next - pd.Timedelta(seconds=30))]
             if win.empty: continue
-            last = win.sort_values("recorded_at").groupby("outcome_id").tail(1).set_index("outcome_id").price
-            if len(last) < 2: continue
-            oids = sorted(last.index, key=lambda x: int(x)); q = [1 / last[o] for o in oids]
+            lastrow = win.sort_values("recorded_at").groupby("outcome_id").tail(1).set_index("outcome_id")
+            if len(lastrow) < 2: continue
+            oids = sorted(lastrow.index, key=lambda x: int(x)); q = [1 / float(lastrow.price[o]) for o in oids]
+            lim = [float(lastrow.limit[o]) if pd.notna(lastrow.limit[o]) else float("nan") for o in oids]
             if not (0.95 <= sum(q) <= 1.2): continue
             pA_mkt = q[1] / sum(q) if r.flip else q[0] / sum(q)   # outcome '1' = participant1 фікстури; flip → participant1 = Leaguepedia B
             p_fav_mkt = pA_mkt if fav == "A" else 1 - pA_mkt
+            # глибина на стороні ЛІДЕРА серії (того, кого модель каже купувати)
+            leader_is_A = (fw > fl) == (fav == "A") if fw != fl else None
+            if leader_is_A is None: lim_leader = min(lim)
+            else:
+                idx_A = 1 if r.flip else 0; lim_leader = lim[idx_A] if leader_is_A else lim[1 - idx_A]
             rows.append({"match_id": r.match_id, "date": r.date, "level": r.level, "state": st, "p_fav_prior": pf,
-                         "p_fav_indep": p_series(pf, fw, fl), "p_fav_market": p_fav_mkt, "fav_won": int(r.winner == fav)})
+                         "p_fav_indep": p_series(pf, fw, fl), "p_fav_market": p_fav_mkt, "fav_won": int(r.winner == fav),
+                         "limit_leader": lim_leader})
     print(f"[{bookmaker}] fixtures with in-play snapshots: {n_inplay}; state-price points: {len(rows)}")
     if not rows: return None
     M = pd.DataFrame(rows); M.to_csv(RES / f"{bookmaker}_at_score.csv", index=False)
     for lvl, G in M.groupby("level"):
         print(f"\n=== {bookmaker} series-ML price at score change — {lvl} (favorite perspective) ===")
         print(G.groupby("state").agg(n=("fav_won", "size"), realized=("fav_won", "mean"), market=("p_fav_market", "mean"),
-                                     indep=("p_fav_indep", "mean")).round(3).to_string())
+                                     indep=("p_fav_indep", "mean"), depth_med=("limit_leader", "median")).round(3).to_string())
     return M
 
 price_at_score("pinnacle"); price_at_score("polymarket")
