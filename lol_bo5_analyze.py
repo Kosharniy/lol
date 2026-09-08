@@ -158,34 +158,45 @@ S["p_elo_A"] = 1 / (1 + 10 ** ((S.eloB - S.eloA) / 400))
 state_table(S[S.level != "Other"], "p_elo_A", "elo")
 if S.p_pin_A.notna().any(): state_table(S[S.p_pin_A.notna()], "p_pin_A", "market")
 
-# ---------------------------------------------------------------- Polymarket price at score changes (ML серії)
-if not pr.empty and winner_mid is not None and S.fixture_id.notna().any():
-    pm = pr[(pr.bookmaker == "polymarket") & (pr.market_id == str(winner_mid))]
-    rows = []
+# ---------------------------------------------------------------- price of series ML at score changes (Pinnacle in-play / Polymarket)
+# Момент "рахунок k:l відомий" = останні хвилини перед стартом наступної гри (Leaguepedia dt наступної гри); беремо медіану
+# останніх 3 снапшотів кожного outcome у вікні [start_next − 25 хв, start_next − 1 хв].
+def price_at_score(bookmaker):
+    if pr.empty or winner_mid is None or not S.fixture_id.notna().any(): return None
+    bk = pr[(pr.bookmaker == bookmaker) & (pr.market_id == str(winner_mid))]
+    if bk.empty: print(f"[{bookmaker}] no rows"); return None
+    rows = []; n_inplay = 0
     for r in S[S.fixture_id.notna()].itertuples(index=False):
-        h = pm[pm.fixture_id == r.fixture_id]
+        h = bk[bk.fixture_id == r.fixture_id]
         if h.empty: continue
-        fw = fl = 0; pA = r.p_pin_A if r.p_pin_A is not None and not pd.isna(r.p_pin_A) else r.p_elo_A
+        pA = r.p_pin_A if r.p_pin_A is not None and not pd.isna(r.p_pin_A) else r.p_elo_A
         fav = "A" if pA >= 0.5 else "B"; pf = max(pA, 1 - pA)
+        starts = [pd.Timestamp(x).tz_localize("UTC") for x in r.ends]  # dt = початок кожної гри
+        if (h.recorded_at > starts[0]).any(): n_inplay += 1
+        fw = fl = 0
         for k, ch in enumerate(r.seq):
             fw += (ch == fav); fl += (ch != fav); st = f"{fw}:{fl}"
-            if st not in ("2:0", "0:2", "2:1", "1:2", "2:2", "1:0", "0:1", "1:1"): continue
-            t_end = pd.Timestamp(r.ends[k]).tz_localize("UTC") + pd.Timedelta(minutes=40)  # ~кінець гри k (dt = початок гри) — уточнити
-            after = h[(h.recorded_at >= t_end) & (h.recorded_at <= t_end + pd.Timedelta(minutes=12))].sort_values("recorded_at")
-            if after.empty: continue
-            last = after.groupby("outcome_id").tail(3).groupby("outcome_id").price.median()
+            if k + 1 >= len(starts): break  # серія закінчилась — наступної гри нема
+            t_next = starts[k + 1]
+            win = h[(h.recorded_at >= t_next - pd.Timedelta(minutes=25)) & (h.recorded_at <= t_next - pd.Timedelta(minutes=1))]
+            if win.empty: continue
+            last = win.sort_values("recorded_at").groupby("outcome_id").tail(3).groupby("outcome_id").price.median()
             if len(last) < 2: continue
             oids = sorted(last.index, key=lambda x: int(x)); q = [1 / last[o] for o in oids]
             if not (0.95 <= sum(q) <= 1.2): continue
             p_fav_mkt = q[0] / sum(q) if fav == "A" else q[1] / sum(q)
             rows.append({"match_id": r.match_id, "date": r.date, "level": r.level, "state": st, "p_fav_prior": pf,
                          "p_fav_indep": p_series(pf, fw, fl), "p_fav_market": p_fav_mkt, "fav_won": int(r.winner == fav)})
-    if rows:
-        M = pd.DataFrame(rows); M.to_csv(RES / "polymarket_at_score.csv", index=False)
-        print("\n=== Polymarket ML price at score change (favorite perspective) ===")
-        print(M.groupby("state").agg(n=("fav_won", "size"), realized=("fav_won", "mean"), market=("p_fav_market", "mean"), indep=("p_fav_indep", "mean")).round(3).to_string())
-    else:
-        print("\n[polymarket] no in-play price points found in window — перевірити, чи OddsPapi зберігає in-play рухи Polymarket (data/raw/hist_sample.json)")
+    print(f"[{bookmaker}] fixtures with in-play snapshots: {n_inplay}; state-price points: {len(rows)}")
+    if not rows: return None
+    M = pd.DataFrame(rows); M.to_csv(RES / f"{bookmaker}_at_score.csv", index=False)
+    for lvl, G in M.groupby("level"):
+        print(f"\n=== {bookmaker} series-ML price at score change — {lvl} (favorite perspective) ===")
+        print(G.groupby("state").agg(n=("fav_won", "size"), realized=("fav_won", "mean"), market=("p_fav_market", "mean"),
+                                     indep=("p_fav_indep", "mean")).round(3).to_string())
+    return M
+
+price_at_score("pinnacle"); price_at_score("polymarket")
 
 # underdog 2:0 cases list
 cases = []
