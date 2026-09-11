@@ -31,6 +31,7 @@ import requests
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 STATE = Path("alert_state.json")
+SIGNALS = Path("signals.csv")   # forward-test: усі ситуації 0:1/0:2 + результат серії
 UA = {"User-Agent": "lol-series-alert/0.2"}
 
 TIER1 = ("lck", "lpl", "lec", "lta", "lcs", "lcp", "msi", "worlds", "first stand", "ewc")
@@ -94,14 +95,68 @@ def best_ask(token_id):
     a = min(b["asks"], key=lambda x: float(x["price"]))
     return float(a["price"]), float(a["size"])
 
+SIG_COLS = ["ts", "event_id", "slug", "title", "tier1", "state", "leader", "fav", "p_pre",
+            "ask", "fair", "edge", "depth", "alerted", "leader_won", "final_score"]
+
+def log_signal(row):
+    """пише подію один раз на (event, state) — щоб не дублювати кожні 2 хв"""
+    import csv
+    rows = []
+    if SIGNALS.exists():
+        with SIGNALS.open(encoding="utf-8") as f: rows = list(csv.DictReader(f))
+    key = (row["event_id"], row["state"])
+    for r in rows:
+        if (r["event_id"], r["state"]) == key: return False
+    rows.append({c: row.get(c, "") for c in SIG_COLS})
+    with SIGNALS.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SIG_COLS); w.writeheader(); w.writerows(rows)
+    return True
+
+def resolve_signals():
+    """дописує результат серії для записів без leader_won"""
+    import csv
+    if not SIGNALS.exists(): return
+    with SIGNALS.open(encoding="utf-8") as f: rows = list(csv.DictReader(f))
+    pend = [r for r in rows if not r.get("leader_won")]
+    if not pend: return
+    changed = 0
+    for r in pend:
+        ev = get(f"{GAMMA}/events", slug=r["slug"])
+        ev = ev[0] if isinstance(ev, list) and ev else None
+        if not ev or not (ev.get("ended") or ev.get("closed")): continue
+        sc = parse_score(ev.get("score"))
+        ml = next((m for m in (ev.get("markets") or []) if m.get("sportsMarketType") == "moneyline"), None)
+        if not ml: continue
+        outs = jload(ml.get("outcomes"), []) or []
+        prices = [float(x) for x in (jload(ml.get("outcomePrices"), []) or [])]
+        if len(outs) != 2 or len(prices) != 2 or max(prices) < 0.99: continue
+        winner = outs[prices.index(max(prices))]
+        r["leader_won"] = "1" if winner == r["leader"] else "0"
+        r["final_score"] = f"{sc[0]}-{sc[1]}" if sc else ""
+        changed += 1
+        print(f"[resolve] {r['title'][:60]} {r['state']} лідер={r['leader']} → {'WIN' if r['leader_won']=='1' else 'LOSS'} ({r['final_score']})")
+    if changed:
+        with SIGNALS.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=SIG_COLS); w.writeheader(); w.writerows(rows)
+        done = [r for r in rows if r.get("leader_won")]
+        t1 = [r for r in done if r.get("tier1") == "True"]
+        for label, g in (("тір-1", t1), ("усі", done)):
+            if g:
+                wins = sum(int(r["leader_won"]) for r in g)
+                avg_ask = sum(float(r["ask"]) for r in g) / len(g)
+                print(f"[forward-test {label}] n={len(g)} лідер виграв {wins} ({wins/len(g):.0%}), середній ask {avg_ask:.2f}, "
+                      f"наївний PnL/контракт {(wins/len(g) - avg_ask)*100:+.1f}¢")
+
 def scan(a, st):
     evs = get(f"{GAMMA}/events", series_slug="league-of-legends", closed="false", limit=100,
               order="startDate", ascending="false") or []
-    n_bo5 = 0
+    n_bo5 = 0; seen_states = {}; n_live = 0
     for ev in evs:
         sc = parse_score(ev.get("score"))
         if not sc or not sc[2].lower().startswith("bo5") or ev.get("ended"): continue
         n_bo5 += 1
+        seen_states[f"{sc[0]}-{sc[1]}"] = seen_states.get(f"{sc[0]}-{sc[1]}", 0) + 1
+        if ev.get("live"): n_live += 1
         title = ev.get("title") or ev.get("slug"); slug = ev.get("slug")
         teams = [t.get("name") for t in (ev.get("teams") or [])]
         ml = next((m for m in (ev.get("markets") or []) if m.get("sportsMarketType") == "moneyline"), None)
@@ -123,7 +178,7 @@ def scan(a, st):
         if a.verbose or a.once:
             print(f"  {'T1' if tier1 else 't2'} | {title[:66]} | {w0}-{w1} | live={ev.get('live')} | "
                   f"pre={pre['fav'] + ' ' + format(pre['p'], '.2f') if pre else '—'}")
-        if not tier1 or not pre: continue
+        if not pre: continue
 
         fi = pre["fav_idx"]; fw = (w0, w1)[fi]; lw = (w0, w1)[1 - fi]
         state = f"{fw}:{lw}"
@@ -133,9 +188,15 @@ def scan(a, st):
         ask, size = best_ask(toks[1 - fi])
         if ask is None: continue
         edge = fair_leader - ask; depth = ask * size
-        ok = edge >= a.edge and depth >= a.min_depth and 0.15 <= ask <= 0.85
+        ok = tier1 and edge >= a.edge and depth >= a.min_depth and 0.15 <= ask <= 0.85
         print(f"  → {state} лідер={leader} ask={ask:.3f} fair={fair_leader:.3f} edge={edge*100:+.1f}¢ "
-              f"depth=${depth:.0f} {'*** ALERT ***' if ok else ''}", flush=True)
+              f"depth=${depth:.0f} {'*** ALERT ***' if ok else ('(тір-2, лише лог)' if not tier1 else '')}", flush=True)
+        if log_signal({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "event_id": str(ev.get("id")),
+                       "slug": slug, "title": title, "tier1": tier1, "state": state, "leader": leader,
+                       "fav": pre["fav"], "p_pre": round(pre["p"], 3), "ask": round(ask, 3),
+                       "fair": round(fair_leader, 3), "edge": round(edge, 3), "depth": round(depth), "alerted": ok}):
+            print(f"  [log] записано у signals.csv", flush=True)
+        if not tier1: continue
         tag = f"{state}|{round(ask, 2)}"
         if ok and rec.get("alerted") != tag:
             rec["alerted"] = tag
@@ -144,7 +205,7 @@ def scan(a, st):
                f"Ask лідера <b>{ask:.2f}</b> | fair {fair_leader:.2f} | edge <b>{edge*100:+.0f}¢</b>\n"
                f"Глибина на ask ≈ <b>${depth:.0f}</b> → розмір ≤ ${depth*0.5:.0f}\n"
                f"Тримати до кінця серії. https://polymarket.com/event/{slug}", a.dry_run)
-    return n_bo5
+    return n_bo5, n_live, seen_states
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -161,8 +222,9 @@ if __name__ == "__main__":
     st = json.loads(STATE.read_text()) if STATE.exists() else {}
     while True:
         try:
-            n = scan(a, st); STATE.write_text(json.dumps(st, indent=1))
-            print(f"[{datetime.now(timezone.utc):%H:%M:%S}] BO5 у полі зору: {n}", flush=True)
+            n, nlive, states = scan(a, st); STATE.write_text(json.dumps(st, indent=1)); resolve_signals()
+            ss = ", ".join(f"{k}×{v}" for k, v in sorted(states.items())) or "—"
+            print(f"[{datetime.now(timezone.utc):%H:%M:%S}] BO5: {n} (live {nlive}) | стани: {ss}", flush=True)
         except Exception as e:
             print(f"[loop] {type(e).__name__}: {e}", flush=True)
         if a.once: break
