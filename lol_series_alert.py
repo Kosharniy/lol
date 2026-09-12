@@ -160,14 +160,14 @@ def resolve_signals():
                 wins = sum(int(r["leader_won"]) for r in g)
                 avg_ask = sum(float(r["ask"]) for r in g) / len(g)
                 traded = [r for r in g if r.get("alerted") == "True"]
-                bb = [float(r["best_ask"]) for r in g if r.get("best_ask")]
+                bb = [float(r.get("best_ask") or r["ask"]) for r in g]
                 avg_best = sum(bb) / len(bb) if bb else float("nan")
                 print(f"[forward-test {label}] n={len(g)} лідер виграв {wins} ({wins/len(g):.0%}) | "
                       f"перший ask {avg_ask:.2f} → PnL {(wins/len(g) - avg_ask)*100:+.1f}¢ | "
                       f"кращий ask {avg_best:.2f} → PnL {(wins/len(g) - avg_best)*100:+.1f}¢")
                 if traded:
                     tw = sum(int(r["leader_won"]) for r in traded)
-                    ta = sum(float(r["best_ask"] or r["ask"]) for r in traded) / len(traded)
+                    ta = sum(float(r.get("best_ask") or r["ask"]) for r in traded) / len(traded)
                     print(f"[forward-test {label} — ТІЛЬКИ сигнали з алертом] n={len(traded)} виграв {tw} ({tw/len(traded):.0%}), "
                           f"ask {ta:.2f}, PnL/контракт {(tw/len(traded) - ta)*100:+.1f}¢")
 
@@ -196,7 +196,12 @@ def scan(a, st):
         now = datetime.now(timezone.utc)
         seen = rec.setdefault("seen", {})            # коли вперше побачили кожен рахунок
         skey = f"{w0}-{w1}"
-        if skey not in seen: seen[skey] = now.isoformat(timespec="seconds")
+        if skey not in seen:
+            # якщо ми ВПЕРШЕ бачимо цю подію і рахунок уже не 0-0 (рестарт посеред серії) —
+            # ми не спостерігали переходу, тож вікно вважаємо давно закритим
+            witnessed = bool(seen) or skey == "0-0"
+            seen[skey] = now.isoformat(timespec="seconds") if witnessed else "1970-01-01T00:00:00+00:00"
+            if not witnessed: print(f"  [warn] {title[:50]}: побачили {skey} без переходу — вікно закрите", flush=True)
         if w0 == 0 and w1 == 0 and "pre" not in rec:     # фіксуємо pre-match фаворита до першої гри
             i = prices.index(max(prices))
             rec["pre"] = {"fav_idx": i, "fav": outs[i], "p": max(prices), "title": title, "slug": slug}
