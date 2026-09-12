@@ -40,6 +40,9 @@ EXCLUDE = ("challengers", "academy", "ldl", "lfl", "nlc", "tcl", "prime league",
            "regional", "rift legends", "master flow", "liga ")
 # реалізована частота перемоги ФАВОРИТА з цього стану (Polymarket Primary 2026: 0:1 → 22/64, 0:2 → 3/34)
 REALIZED = {"0:1": 0.344, "0:2": 0.088}
+# вхід дозволений ЛИШЕ у вікні між іграми: N хвилин від моменту, коли ми вперше побачили новий рахунок.
+# Поза цим вікном іде наступна гра, і ціна вже містить ін-гейм інформацію, якої модель не бачить.
+WINDOW_MIN = 14
 
 def p_series(p, w, l):
     if w >= 3: return 1.0
@@ -96,21 +99,33 @@ def best_ask(token_id):
     return float(a["price"]), float(a["size"])
 
 SIG_COLS = ["ts", "event_id", "slug", "title", "tier1", "state", "leader", "fav", "p_pre",
-            "ask", "fair", "edge", "depth", "alerted", "leader_won", "final_score"]
+            "ask", "fair", "edge", "depth", "best_ask", "best_edge", "best_depth", "best_ts", "n_obs",
+            "alerted", "leader_won", "final_score"]
 
 def log_signal(row):
-    """пише подію один раз на (event, state) — щоб не дублювати кожні 2 хв"""
+    """один рядок на (event, state): перше спостереження + НАЙКРАЩИЙ edge за весь час стану.
+    Повертає 'new' для нового рядка, 'better' якщо оновили найкращий, '' якщо без змін."""
     import csv
     rows = []
     if SIGNALS.exists():
         with SIGNALS.open(encoding="utf-8") as f: rows = list(csv.DictReader(f))
-    key = (row["event_id"], row["state"])
-    for r in rows:
-        if (r["event_id"], r["state"]) == key: return False
-    rows.append({c: row.get(c, "") for c in SIG_COLS})
+    key = (row["event_id"], row["state"]); status = ""
+    cur = next((r for r in rows if (r["event_id"], r["state"]) == key), None)
+    if cur is None:
+        row.update({"best_ask": row["ask"], "best_edge": row["edge"], "best_depth": row["depth"],
+                    "best_ts": row["ts"], "n_obs": 1})
+        rows.append({c: row.get(c, "") for c in SIG_COLS}); status = "new"
+    else:
+        if cur.get("leader_won"): return ""          # серія вже розв'язана — не чіпаємо
+        cur["n_obs"] = int(cur.get("n_obs") or 1) + 1
+        # "краще" = більший edge при достатній глибині (інакше це неторгована ціна на порожній книзі)
+        if row.get("in_window") and float(row["edge"]) > float(cur.get("best_edge") or -9) and float(row["depth"]) >= 300:
+            cur.update({"best_ask": row["ask"], "best_edge": row["edge"], "best_depth": row["depth"],
+                        "best_ts": row["ts"]}); status = "better"
     with SIGNALS.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=SIG_COLS); w.writeheader(); w.writerows(rows)
-    return True
+        w = csv.DictWriter(f, fieldnames=SIG_COLS); w.writeheader()
+        w.writerows([{c: r.get(c, "") for c in SIG_COLS} for r in rows])
+    return status
 
 def resolve_signals():
     """дописує результат серії для записів без leader_won"""
@@ -144,8 +159,17 @@ def resolve_signals():
             if g:
                 wins = sum(int(r["leader_won"]) for r in g)
                 avg_ask = sum(float(r["ask"]) for r in g) / len(g)
-                print(f"[forward-test {label}] n={len(g)} лідер виграв {wins} ({wins/len(g):.0%}), середній ask {avg_ask:.2f}, "
-                      f"наївний PnL/контракт {(wins/len(g) - avg_ask)*100:+.1f}¢")
+                traded = [r for r in g if r.get("alerted") == "True"]
+                bb = [float(r["best_ask"]) for r in g if r.get("best_ask")]
+                avg_best = sum(bb) / len(bb) if bb else float("nan")
+                print(f"[forward-test {label}] n={len(g)} лідер виграв {wins} ({wins/len(g):.0%}) | "
+                      f"перший ask {avg_ask:.2f} → PnL {(wins/len(g) - avg_ask)*100:+.1f}¢ | "
+                      f"кращий ask {avg_best:.2f} → PnL {(wins/len(g) - avg_best)*100:+.1f}¢")
+                if traded:
+                    tw = sum(int(r["leader_won"]) for r in traded)
+                    ta = sum(float(r["best_ask"] or r["ask"]) for r in traded) / len(traded)
+                    print(f"[forward-test {label} — ТІЛЬКИ сигнали з алертом] n={len(traded)} виграв {tw} ({tw/len(traded):.0%}), "
+                          f"ask {ta:.2f}, PnL/контракт {(tw/len(traded) - ta)*100:+.1f}¢")
 
 def scan(a, st):
     evs = get(f"{GAMMA}/events", series_slug="league-of-legends", closed="false", limit=100,
@@ -169,6 +193,10 @@ def scan(a, st):
         tier1 = is_tier1(title)
 
         rec = st.setdefault(str(ev.get("id")), {})
+        now = datetime.now(timezone.utc)
+        seen = rec.setdefault("seen", {})            # коли вперше побачили кожен рахунок
+        skey = f"{w0}-{w1}"
+        if skey not in seen: seen[skey] = now.isoformat(timespec="seconds")
         if w0 == 0 and w1 == 0 and "pre" not in rec:     # фіксуємо pre-match фаворита до першої гри
             i = prices.index(max(prices))
             rec["pre"] = {"fav_idx": i, "fav": outs[i], "p": max(prices), "title": title, "slug": slug}
@@ -188,19 +216,26 @@ def scan(a, st):
         ask, size = best_ask(toks[1 - fi])
         if ask is None: continue
         edge = fair_leader - ask; depth = ask * size
-        ok = tier1 and edge >= a.edge and depth >= a.min_depth and 0.15 <= ask <= 0.85
+        age_min = (now - datetime.fromisoformat(seen[skey])).total_seconds() / 60
+        in_window = age_min <= a.window
+        ok = (tier1 and in_window and edge >= a.edge and depth >= a.min_depth and 0.15 <= ask <= 0.85)
+        why = "*** ALERT ***" if ok else ("(тір-2, лог)" if not tier1 else
+              (f"(поза вікном: {age_min:.0f} хв від зміни рахунку — гра вже йде)" if not in_window else ""))
         print(f"  → {state} лідер={leader} ask={ask:.3f} fair={fair_leader:.3f} edge={edge*100:+.1f}¢ "
-              f"depth=${depth:.0f} {'*** ALERT ***' if ok else ('(тір-2, лише лог)' if not tier1 else '')}", flush=True)
-        if log_signal({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "event_id": str(ev.get("id")),
-                       "slug": slug, "title": title, "tier1": tier1, "state": state, "leader": leader,
-                       "fav": pre["fav"], "p_pre": round(pre["p"], 3), "ask": round(ask, 3),
-                       "fair": round(fair_leader, 3), "edge": round(edge, 3), "depth": round(depth), "alerted": ok}):
-            print(f"  [log] записано у signals.csv", flush=True)
+              f"depth=${depth:.0f} t+{age_min:.0f}хв {why}", flush=True)
+        stt = log_signal({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "event_id": str(ev.get("id")),
+                          "slug": slug, "title": title, "tier1": tier1, "state": state, "leader": leader,
+                          "fav": pre["fav"], "p_pre": round(pre["p"], 3), "ask": round(ask, 3),
+                          "fair": round(fair_leader, 3), "edge": round(edge, 3), "depth": round(depth),
+                          "in_window": in_window, "alerted": ok})
+        if stt == "new": print("  [log] новий запис у signals.csv", flush=True)
+        elif stt == "better": print(f"  [log] кращий edge за час стану: {edge*100:+.1f}¢ @ {ask:.3f}", flush=True)
         if not tier1: continue
-        tag = f"{state}|{round(ask, 2)}"
+        tag = state
         if ok and rec.get("alerted") != tag:
             rec["alerted"] = tag
             tg(f"<b>LoL BO5 — вхід за правилом</b>\n{title}\n"
+               f"<i>Вікно між іграми: {age_min:.0f} хв від зміни рахунку</i>\n"
                f"Рахунок {state}: веде <b>{leader}</b> (pre-match андердог; фаворит {pre['fav']} був {pre['p']:.0%})\n"
                f"Ask лідера <b>{ask:.2f}</b> | fair {fair_leader:.2f} | edge <b>{edge*100:+.0f}¢</b>\n"
                f"Глибина на ask ≈ <b>${depth:.0f}</b> → розмір ≤ ${depth*0.5:.0f}\n"
@@ -211,6 +246,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--edge", type=float, default=0.08)
     ap.add_argument("--min-depth", type=float, default=300)
+    ap.add_argument("--window", type=float, default=WINDOW_MIN, help="хв від зміни рахунку, коли вхід дозволений")
     ap.add_argument("--interval", type=int, default=120)
     ap.add_argument("--once", action="store_true"); ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
