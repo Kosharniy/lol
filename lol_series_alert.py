@@ -100,7 +100,7 @@ def best_ask(token_id):
 
 SIG_COLS = ["ts", "event_id", "slug", "title", "tier1", "state", "leader", "fav", "p_pre",
             "ask", "fair", "edge", "depth", "best_ask", "best_edge", "best_depth", "best_ts", "n_obs",
-            "alerted", "leader_won", "final_score"]
+            "alerted", "alert_ask", "alert_ts", "leader_won", "final_score", "pnl_cents"]
 
 def log_signal(row):
     """один рядок на (event, state): перше спостереження + НАЙКРАЩИЙ edge за весь час стану.
@@ -127,14 +127,26 @@ def log_signal(row):
         w.writerows([{c: r.get(c, "") for c in SIG_COLS} for r in rows])
     return status
 
-def resolve_signals():
+def mark_alerted(event_id, state, ask, ts):
+    """фіксує ціну входу паперової позиції в signals.csv"""
+    import csv
+    if not SIGNALS.exists(): return
+    with SIGNALS.open(encoding="utf-8") as f: rows = list(csv.DictReader(f))
+    for r in rows:
+        if (r["event_id"], r["state"]) == (event_id, state):
+            r["alerted"] = "True"; r["alert_ask"] = round(ask, 3); r["alert_ts"] = ts
+    with SIGNALS.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SIG_COLS); w.writeheader()
+        w.writerows([{c: r.get(c, "") for c in SIG_COLS} for r in rows])
+
+def resolve_signals(dry=False):
     """дописує результат серії для записів без leader_won"""
     import csv
     if not SIGNALS.exists(): return
     with SIGNALS.open(encoding="utf-8") as f: rows = list(csv.DictReader(f))
     pend = [r for r in rows if not r.get("leader_won")]
     if not pend: return
-    changed = 0
+    changed = 0; resolved = []
     for r in pend:
         ev = get(f"{GAMMA}/events", slug=r["slug"])
         ev = ev[0] if isinstance(ev, list) and ev else None
@@ -148,11 +160,27 @@ def resolve_signals():
         winner = outs[prices.index(max(prices))]
         r["leader_won"] = "1" if winner == r["leader"] else "0"
         r["final_score"] = f"{sc[0]}-{sc[1]}" if sc else ""
+        won = r["leader_won"] == "1"
+        if r.get("alerted") == "True" and r.get("alert_ask"):
+            entry = float(r["alert_ask"]); r["pnl_cents"] = round(((1 if won else 0) - entry) * 100, 1)
+            resolved.append(r)
         changed += 1
-        print(f"[resolve] {r['title'][:60]} {r['state']} лідер={r['leader']} → {'WIN' if r['leader_won']=='1' else 'LOSS'} ({r['final_score']})")
+        print(f"[resolve] {r['title'][:60]} {r['state']} лідер={r['leader']} → {'WIN' if won else 'LOSS'} ({r['final_score']})")
     if changed:
         with SIGNALS.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=SIG_COLS); w.writeheader(); w.writerows(rows)
+        # повідомлення про результат кожної паперової позиції
+        alerted_done = [r for r in rows if r.get("alerted") == "True" and r.get("leader_won") and r.get("alert_ask")]
+        for r in resolved:
+            w = int(r["leader_won"]); pnl = float(r["pnl_cents"])
+            n = len(alerted_done); wins = sum(int(x["leader_won"]) for x in alerted_done)
+            avg = sum(float(x["alert_ask"]) for x in alerted_done) / n
+            tot = sum(float(x["pnl_cents"]) for x in alerted_done)
+            tg(f"<b>Результат сигналу</b>\n{r['title']}\n"
+               f"{r['state']} лідер {r['leader']} — <b>{'ВИГРАВ' if w else 'ПРОГРАВ'}</b> ({r['final_score']})\n"
+               f"Вхід {float(r['alert_ask']):.2f} → PnL <b>{pnl:+.0f}¢</b> на контракт\n"
+               f"Накопичено: {n} сигналів, виграно {wins} ({wins/n:.0%}), середній вхід {avg:.2f}, "
+               f"сумарно <b>{tot:+.0f}¢</b> (беззбитковість {avg:.0%})", dry)
         done = [r for r in rows if r.get("leader_won")]
         t1 = [r for r in done if r.get("tier1") == "True"]
         for label, g in (("тір-1", t1), ("усі", done)):
@@ -223,9 +251,13 @@ def scan(a, st):
         edge = fair_leader - ask; depth = ask * size
         age_min = (now - datetime.fromisoformat(seen[skey])).total_seconds() / 60
         in_window = age_min <= a.window
-        ok = (tier1 and in_window and edge >= a.edge and depth >= a.min_depth and 0.15 <= ask <= 0.85)
+        # ПРАВИЛО v2 (14.09.2026, без вільних параметрів): тір-1 + вікно між іграми + глибина + ціна нижче стелі.
+        # Жодної моделі й порога edge: перевіряємо прямо емпіричний факт "лідер серії недооцінений".
+        ok = (tier1 and in_window and depth >= a.min_depth and a.min_ask <= ask <= a.max_ask)
         why = "*** ALERT ***" if ok else ("(тір-2, лог)" if not tier1 else
-              (f"(поза вікном: {age_min:.0f} хв від зміни рахунку — гра вже йде)" if not in_window else ""))
+              (f"(поза вікном: {age_min:.0f} хв від зміни рахунку — гра вже йде)" if not in_window else
+               (f"(глибина ${depth:.0f} < ${a.min_depth:.0f})" if depth < a.min_depth else
+                (f"(ціна {ask:.2f} поза {a.min_ask}-{a.max_ask})" if not (a.min_ask <= ask <= a.max_ask) else ""))))
         print(f"  → {state} лідер={leader} ask={ask:.3f} fair={fair_leader:.3f} edge={edge*100:+.1f}¢ "
               f"depth=${depth:.0f} t+{age_min:.0f}хв {why}", flush=True)
         stt = log_signal({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "event_id": str(ev.get("id")),
@@ -239,17 +271,21 @@ def scan(a, st):
         tag = state
         if ok and rec.get("alerted") != tag:
             rec["alerted"] = tag
+            mark_alerted(str(ev.get("id")), state, ask, now.isoformat(timespec="seconds"))
             tg(f"<b>LoL BO5 — вхід за правилом</b>\n{title}\n"
                f"<i>Вікно між іграми: {age_min:.0f} хв від зміни рахунку</i>\n"
                f"Рахунок {state}: веде <b>{leader}</b> (pre-match андердог; фаворит {pre['fav']} був {pre['p']:.0%})\n"
-               f"Ask лідера <b>{ask:.2f}</b> | fair {fair_leader:.2f} | edge <b>{edge*100:+.0f}¢</b>\n"
+               f"Купувати <b>{leader}</b> по <b>{ask:.2f}</b> (ринок серії / Moneyline)\n"
+               f"довідково: модель {fair_leader:.2f}, edge {edge*100:+.0f}¢ — у правилі v2 не використовується\n"
                f"Глибина на ask ≈ <b>${depth:.0f}</b> → розмір ≤ ${depth*0.5:.0f}\n"
                f"Тримати до кінця серії. https://polymarket.com/event/{slug}", a.dry_run)
     return n_bo5, n_live, seen_states
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--edge", type=float, default=0.08)
+    ap.add_argument("--max-ask", type=float, default=0.80, help="стеля ціни лідера (правило v2)")
+    ap.add_argument("--min-ask", type=float, default=0.15)
+    ap.add_argument("--edge", type=float, default=0.08, help="(не використовується в правилі v2, лише в логах)")
     ap.add_argument("--min-depth", type=float, default=300)
     ap.add_argument("--window", type=float, default=WINDOW_MIN, help="хв від зміни рахунку, коли вхід дозволений")
     ap.add_argument("--interval", type=int, default=120)
@@ -263,7 +299,7 @@ if __name__ == "__main__":
     st = json.loads(STATE.read_text()) if STATE.exists() else {}
     while True:
         try:
-            n, nlive, states = scan(a, st); STATE.write_text(json.dumps(st, indent=1)); resolve_signals()
+            n, nlive, states = scan(a, st); STATE.write_text(json.dumps(st, indent=1)); resolve_signals(a.dry_run)
             ss = ", ".join(f"{k}×{v}" for k, v in sorted(states.items())) or "—"
             print(f"[{datetime.now(timezone.utc):%H:%M:%S}] BO5: {n} (live {nlive}) | стани: {ss}", flush=True)
         except Exception as e:
