@@ -173,31 +173,51 @@ def resolve_signals(dry=False):
         alerted_done = [r for r in rows if r.get("alerted") == "True" and r.get("leader_won") and r.get("alert_ask")]
         for r in resolved:
             w = int(r["leader_won"]); pnl = float(r["pnl_cents"])
-            n = len(alerted_done); wins = sum(int(x["leader_won"]) for x in alerted_done)
-            avg = sum(float(x["alert_ask"]) for x in alerted_done) / n
-            tot = sum(float(x["pnl_cents"]) for x in alerted_done)
+            uniq = {}
+            for x in alerted_done:
+                if x["event_id"] not in uniq or x["state"] < uniq[x["event_id"]]["state"]: uniq[x["event_id"]] = x
+            u = list(uniq.values())
+            n = len(u); wins = sum(int(x["leader_won"]) for x in u)
+            avg = sum(float(x["alert_ask"]) for x in u) / n
+            tot = sum(float(x["pnl_cents"]) for x in u)
             tg(f"<b>Результат сигналу</b>\n{r['title']}\n"
                f"{r['state']} лідер {r['leader']} — <b>{'ВИГРАВ' if w else 'ПРОГРАВ'}</b> ({r['final_score']})\n"
                f"Вхід {float(r['alert_ask']):.2f} → PnL <b>{pnl:+.0f}¢</b> на контракт\n"
-               f"Накопичено: {n} сигналів, виграно {wins} ({wins/n:.0%}), середній вхід {avg:.2f}, "
+               f"Накопичено: {n} серій (унікальних), виграно {wins} ({wins/n:.0%}), середній вхід {avg:.2f}, "
                f"сумарно <b>{tot:+.0f}¢</b> (беззбитковість {avg:.0%})", dry)
         done = [r for r in rows if r.get("leader_won")]
-        t1 = [r for r in done if r.get("tier1") == "True"]
-        for label, g in (("тір-1", t1), ("усі", done)):
-            if g:
-                wins = sum(int(r["leader_won"]) for r in g)
-                avg_ask = sum(float(r["ask"]) for r in g) / len(g)
-                traded = [r for r in g if r.get("alerted") == "True"]
-                bb = [float(r.get("best_ask") or r["ask"]) for r in g]
-                avg_best = sum(bb) / len(bb) if bb else float("nan")
-                print(f"[forward-test {label}] n={len(g)} лідер виграв {wins} ({wins/len(g):.0%}) | "
-                      f"перший ask {avg_ask:.2f} → PnL {(wins/len(g) - avg_ask)*100:+.1f}¢ | "
-                      f"кращий ask {avg_best:.2f} → PnL {(wins/len(g) - avg_best)*100:+.1f}¢")
-                if traded:
-                    tw = sum(int(r["leader_won"]) for r in traded)
-                    ta = sum(float(r.get("best_ask") or r["ask"]) for r in traded) / len(traded)
-                    print(f"[forward-test {label} — ТІЛЬКИ сигнали з алертом] n={len(traded)} виграв {tw} ({tw/len(traded):.0%}), "
-                          f"ask {ta:.2f}, PnL/контракт {(tw/len(traded) - ta)*100:+.1f}¢")
+        summarize(done)
+
+def summarize(done):
+    """Зведення по УНІКАЛЬНИХ серіях, а не по рядках.
+    0:1 і 0:2 з однієї серії — одне спостереження (обидва виграють/програють разом),
+    рахувати їх окремо означає завищити n і занизити дисперсію.
+    Вхід беремо на найранішому стані (0:1, якщо він був)."""
+    by_ev = {}
+    for r in done:
+        ev = r["event_id"]
+        cur = by_ev.get(ev)
+        if cur is None or r["state"] < cur["state"]:   # "0:1" < "0:2"
+            by_ev[ev] = r
+    series = list(by_ev.values())
+    for label, g in (("тір-1", [r for r in series if r.get("tier1") == "True"]),
+                     ("тір-2", [r for r in series if r.get("tier1") != "True"]),
+                     ("усі", series)):
+        if not g: continue
+        n = len(g); wins = sum(int(r["leader_won"]) for r in g)
+        entry = [float(r.get("best_ask") or r["ask"]) for r in g]
+        avg = sum(entry) / n
+        pnl = sum((int(r["leader_won"]) - e) for r, e in zip(g, entry)) / n * 100
+        se = (wins / n * (1 - wins / n) / n) ** 0.5 * 100
+        print(f"[forward-test {label}] серій={n} лідер виграв {wins} ({wins/n:.0%} ±{se:.0f}) | "
+              f"вхід {avg:.2f} (беззбитковість {avg:.0%}) | PnL {pnl:+.1f}¢/контракт", flush=True)
+    traded = [r for r in series if r.get("alerted") == "True" and r.get("alert_ask")]
+    if traded:
+        n = len(traded); wins = sum(int(r["leader_won"]) for r in traded)
+        entry = [float(r["alert_ask"]) for r in traded]; avg = sum(entry) / n
+        pnl = sum((int(r["leader_won"]) - e) for r, e in zip(traded, entry)) / n * 100
+        print(f"[forward-test ПРАВИЛО v2] серій={n} виграв {wins} ({wins/n:.0%}) | вхід {avg:.2f} | "
+              f"PnL {pnl:+.1f}¢/контракт | до рішення ще {max(0, 30 - n)} серій", flush=True)
 
 def scan(a, st):
     evs = get(f"{GAMMA}/events", series_slug="league-of-legends", closed="false", limit=100,
