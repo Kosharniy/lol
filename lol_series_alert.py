@@ -34,10 +34,17 @@ STATE = Path("alert_state.json")
 SIGNALS = Path("signals.csv")   # forward-test: усі ситуації 0:1/0:2 + результат серії
 UA = {"User-Agent": "lol-series-alert/0.2"}
 
-TIER1 = ("lck", "lpl", "lec", "lta", "lcs", "lcp", "msi", "worlds", "first stand", "ewc")
+TIER1 = ("lck", "lpl", "lec", "lta", "lcs", "lcp", "msi", "worlds", "world championship",
+         "first stand", "ewc", "mid-season")
 EXCLUDE = ("challengers", "academy", "ldl", "lfl", "nlc", "tcl", "prime league", "ultraliga", "hitpoint",
            "cblol", "lplol", "arabian", "circuito", "balkan", "elite series", "greek", "nacl",
-           "regional", "rift legends", "master flow", "liga ")
+           "north regional", "south regional", "rift legends", "master flow", "liga ",
+           "promotion", "qualifier", "university", "collegiate")
+# УВАГА (18.09.2026): слово "regional" у EXCLUDE перекривало LPL Regional Finals — тір-1 матч
+# маркувався як тір-2 і не дав алерту (Team WE vs JD Gaming, 0:1, ціна 0.63, глибина $12.9k).
+# Тому виключення тепер точні ("north regional"/"south regional"), а не за підрядком.
+# Будь-яке нове слово сюди додавати лише перевіривши, що воно не зустрічається в назвах тір-1 турнірів.
+
 # реалізована частота перемоги ФАВОРИТА з цього стану (Polymarket Primary 2026: 0:1 → 22/64, 0:2 → 3/34)
 REALIZED = {"0:1": 0.344, "0:2": 0.088}
 # вхід дозволений ЛИШЕ у вікні між іграми: N хвилин від моменту, коли ми вперше побачили новий рахунок.
